@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="diskscanner/diskscanner.vcxproj" Id="dc175b6a-89ea-4115-a20d-27a4dbb4469a" />
+</Solution>
