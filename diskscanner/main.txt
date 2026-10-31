@@ -1,0 +1,190 @@
+#include <iostream>
+#include <filesystem>
+#include <vector>
+#include <string>
+#include <iomanip>
+#include <algorithm>
+#include <windows.h>
+#include <sstream>
+#include <future> // Thư viện để chạy đa luồng bất đồng bộ
+
+namespace fs = std::filesystem;
+
+struct FileNode {
+    std::string name;
+    uintmax_t size = 0;
+    bool is_dir = false;
+    std::vector<FileNode> children;
+};
+
+// Hàm format dung lượng chuẩn
+std::string FormatSize(uintmax_t bytes) {
+    const char* units[] = { "B", "KB", "MB", "GB", "TB" };
+    int unitIndex = 0;
+    double size = static_cast<double>(bytes);
+
+    while (size >= 1024 && unitIndex < 4) {
+        size /= 1024;
+        unitIndex++;
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << size << " " << units[unitIndex];
+    return out.str();
+}
+
+// Hàm One-Pass Scanner (Giữ nguyên logic cực kỳ tối ưu, chạy độc lập trên mỗi luồng)
+uintmax_t GetSizeAndBuildTree(const fs::path& path, FileNode* node, int currentDepth, int maxDepth) {
+    try {
+        if (fs::is_symlink(path)) return 0;
+    }
+    catch (...) { return 0; }
+
+    uintmax_t currentSize = 0;
+    bool isDir = fs::is_directory(path);
+
+    if (!isDir) {
+        try { currentSize = fs::file_size(path); }
+        catch (...) {}
+        if (node) {
+            node->name = path.filename().string();
+            node->size = currentSize;
+            node->is_dir = false;
+        }
+        return currentSize;
+    }
+
+    if (node) {
+        node->name = path.filename().string();
+        if (node->name.empty()) node->name = path.string();
+        node->is_dir = true;
+    }
+
+    try {
+        for (const auto& entry : fs::directory_iterator(path, fs::directory_options::skip_permission_denied)) {
+            if (fs::is_symlink(entry.symlink_status())) continue;
+
+            bool shouldStoreChild = (node != nullptr) && (currentDepth < maxDepth);
+
+            if (shouldStoreChild) {
+                FileNode childNode;
+                currentSize += GetSizeAndBuildTree(entry.path(), &childNode, currentDepth + 1, maxDepth);
+                node->children.push_back(childNode);
+            }
+            else {
+                currentSize += GetSizeAndBuildTree(entry.path(), nullptr, currentDepth + 1, maxDepth);
+            }
+        }
+    }
+    catch (...) {}
+
+    if (node) {
+        node->size = currentSize;
+        std::sort(node->children.begin(), node->children.end(), [](const FileNode& a, const FileNode& b) {
+            return a.size > b.size;
+            });
+    }
+
+    return currentSize;
+}
+
+// Hàm in cây
+void PrintTree(const FileNode& node, const std::string& prefix, bool isLast, uintmax_t totalRootSize, bool isRoot = false) {
+    double percent = totalRootSize > 0 ? (static_cast<double>(node.size) / totalRootSize) * 100.0 : 0.0;
+
+    if (isRoot) {
+        std::cout << "\n====================================================\n";
+        std::cout << "[ROOT] " << node.name << " (" << FormatSize(node.size) << ", 100%)\n";
+        std::cout << "====================================================\n";
+    }
+    else {
+        std::cout << prefix << (isLast ? "└── " : "├── ") << node.name;
+        std::cout << " (" << FormatSize(node.size) << ", "
+            << std::fixed << std::setprecision(1) << percent << "%)\n";
+    }
+
+    std::string newPrefix = prefix + (isRoot ? "" : (isLast ? "    " : "│   "));
+    for (size_t i = 0; i < node.children.size(); ++i) {
+        PrintTree(node.children[i], newPrefix, i == (node.children.size() - 1), totalRootSize);
+    }
+}
+
+int main() {
+    SetConsoleOutputCP(CP_UTF8);
+
+    std::string targetPath = "C:\\Program Files";
+    int maxDepth = 2;
+
+    fs::path rootPath(targetPath);
+    if (!fs::exists(rootPath) || !fs::is_directory(rootPath)) {
+        std::cerr << "Đường dẫn không hợp lệ!" << std::endl;
+        return 1;
+    }
+
+    std::cout << "Dang quet song song: " << targetPath << " ...\n";
+
+    FileNode rootNode;
+    rootNode.name = rootPath.string();
+    rootNode.is_dir = true;
+
+    // Danh sách các "lời hứa" (futures) sẽ trả về kết quả cấu trúc FileNode từ các luồng
+    std::vector<std::future<FileNode>> futures;
+    std::vector<FileNode> level1Files; // Chứa các file lẻ nằm trơ trọi ở Cấp 1
+
+    // 1. Phân chia công việc tại Tầng 1
+    try {
+        for (const auto& entry : fs::directory_iterator(rootPath, fs::directory_options::skip_permission_denied)) {
+            if (fs::is_symlink(entry.symlink_status())) continue;
+
+            if (fs::is_directory(entry)) {
+                // Đẩy thư mục con cho một luồng mới chạy ngầm (std::async)
+                futures.push_back(std::async(std::launch::async, [entry, maxDepth]() {
+                    FileNode subTree;
+                    GetSizeAndBuildTree(entry.path(), &subTree, 2, maxDepth);
+                    return subTree;
+                    }));
+            }
+            else {
+                // File lẻ thì đọc luôn ở luồng chính (Main Thread) cho nhanh
+                FileNode fileNode;
+                fileNode.name = entry.path().filename().string();
+                fileNode.size = fs::file_size(entry.path());
+                fileNode.is_dir = false;
+                level1Files.push_back(fileNode);
+            }
+        }
+    }
+    catch (...) {}
+
+    // 2. Thu thập kết quả từ các luồng và gộp lại (Merge)
+    uintmax_t totalSize = 0;
+
+    // Đợi tất cả các luồng chạy xong và lấy kết quả
+    for (auto& f : futures) {
+        FileNode completedSubTree = f.get(); // get() sẽ chặn luồng chính cho đến khi luồng con tính xong
+        totalSize += completedSubTree.size;
+        rootNode.children.push_back(completedSubTree);
+    }
+
+    // Cộng dồn các file lẻ vào tổng
+    for (const auto& fileNode : level1Files) {
+        totalSize += fileNode.size;
+        rootNode.children.push_back(fileNode);
+    }
+
+    rootNode.size = totalSize;
+
+    // 3. Sắp xếp lại cấp 1 sau khi đã thu thập đủ mảnh ghép
+    std::sort(rootNode.children.begin(), rootNode.children.end(), [](const FileNode& a, const FileNode& b) {
+        return a.size > b.size;
+        });
+
+    if (rootNode.size == 0) {
+        std::cout << "Thư mục trống hoặc không có quyền truy cập.\n";
+        return 0;
+    }
+
+    PrintTree(rootNode, "", true, rootNode.size, true);
+
+    return 0;
+}
